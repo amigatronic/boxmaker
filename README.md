@@ -10,6 +10,7 @@ without dragging a full CAD suite into the workflow.
 
 ![screenshot placeholder](screenshots/main_window.jpg)
 ![screenshot placeholder](screenshots/main_window_tracing.jpg)
+![screenshot placeholder](screenshots/main_window_section.jpg)
 
 ---
 
