@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) once
 the first tagged release is published.
 
-## [Unreleased]
+## [v.1.0]
 
 ### Added
 - STEP export alongside STL, via a format dropdown in the save dialog.
