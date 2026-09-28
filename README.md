@@ -8,8 +8,8 @@ without dragging a full CAD suite into the workflow.
 > **prismatic (rectangular) boxes only**. See [Roadmap](#roadmap) for
 > what's planned next.
 
-![screenshot placeholder](docs/screenshot.png)
-*(add a screenshot of the app here)*
+![screenshot placeholder](screenshots/main_window.jpg)
+![screenshot placeholder](screenshots/main_window_tracing.jpg)
 
 ---
 
