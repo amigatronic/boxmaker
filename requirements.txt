@@ -1,0 +1,17 @@
+# Core GUI
+PySide6>=6.6
+
+# Parametric solid modeling (OpenCascade-based)
+build123d>=0.5
+
+# 3D rendering (VTK-based)
+pyvista>=0.43
+pyvistaqt>=0.11
+
+# Numerical support (also required by build123d's mesher submodule)
+numpy>=1.26
+scipy>=1.11
+
+# Standalone Windows executable packaging (only needed to build the .exe,
+# not to run the app from source)
+nuitka>=2.0

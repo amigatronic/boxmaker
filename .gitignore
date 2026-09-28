@@ -1,0 +1,44 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# --- Nuitka build artifacts ---
+*.build/
+*.dist/
+*.onefile-build/
+main.build/
+main.dist/
+main.onefile-build/
+BoxMaker.exe
+*.exe
+!/.github/**/*.exe
+
+# --- PyInstaller (in case it's used as an alternative) ---
+*.spec
+
+# --- Windows ---
+Thumbs.db
+desktop.ini
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+
+# --- App-generated output (user exports, not part of the repo) ---
+*.stl
+*.step
+*.stp
+!docs/**/*.stl
+!docs/**/*.step
+
+# --- OS / misc ---
+.DS_Store
