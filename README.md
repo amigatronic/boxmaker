@@ -64,7 +64,7 @@ mounting bosses, etc.).
 ## Installation (from source)
 
 ```bash
-git clone https://github.com/<your-username>/box-maker.git
+git clone https://github.com/amigatronic/box-maker.git
 cd box-maker
 pip install -r requirements.txt
 python main.py
