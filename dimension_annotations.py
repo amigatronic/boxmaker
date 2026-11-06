@@ -13,8 +13,12 @@ labels' visibility test (same kind of conflict already seen between FXAA
 and shadows) - better always visible than invisible.
 """
 
+import logging
+
 import numpy as np
 import pyvista as pv
+
+log = logging.getLogger(__name__)
 
 _AXIS_COLORS = {"x": "red", "y": "green", "z": "blue"}
 
@@ -27,7 +31,7 @@ def setup_orientation_widget(plotter):
     try:
         plotter.add_axes(interactive=False)
     except Exception as e:
-        print("Orientation widget not available:", e)
+        log.warning("Orientation widget not available: %s", e)
 
     try:
         # Interactive navigation cube (FreeCAD/SolidWorks/Fusion style):
@@ -37,7 +41,7 @@ def setup_orientation_widget(plotter):
         # normally on the rest of the viewport).
         plotter.add_camera_orientation_widget()
     except Exception as e:
-        print("Navigation cube not available:", e)
+        log.warning("Navigation cube not available: %s", e)
 
 
 def _dimension_line_mesh(p1, p2, tick_direction, tick_len):

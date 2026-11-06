@@ -9,6 +9,10 @@ os.environ.setdefault("QT_OPENGL", "desktop")
 import logging
 import sys
 
+import app_log
+
+app_log.setup_logging()
+
 # We silence ONLY the known VTK noise (shader compilation related to
 # shadows), not all warnings: a global setLevel(ERROR) would also hide
 # real, unrelated future errors. The filter looks at the message content,
@@ -42,8 +46,8 @@ _fmt.setStencilBufferSize(8)
 QtGui.QSurfaceFormat.setDefaultFormat(_fmt)
 
 try:
-    import vtk
-    vtk.vtkObject.GlobalWarningDisplayOff()
+    from vtkmodules.vtkCommonCore import vtkObject
+    vtkObject.GlobalWarningDisplayOff()
 except Exception:
     pass
 

@@ -10,6 +10,7 @@ module that connects all the others.
 from PySide6 import QtWidgets, QtCore, QtGui
 from pyvistaqt import QtInteractor
 import pyvista as pv
+import logging
 import time
 
 # DEBUG: detailed diagnostics on the 3D widget rebuild (dimensions,
@@ -19,7 +20,7 @@ DEBUG_REBUILD = False
 
 def _dbg(t0, msg):
     if DEBUG_REBUILD:
-        print(f"[REBUILD +{time.perf_counter() - t0:7.4f}s] {msg}")
+        log.info("[REBUILD +%7.4fs] %s", time.perf_counter() - t0, msg)
 
 
 # Known VTK+Qt bug on Windows: certain NVIDIA driver + Qt-shared OpenGL
@@ -37,6 +38,8 @@ from widgets import LabeledSlider, PrecisionSlider
 from i18n import Translator, SUPPORTED_LANGUAGES, LANGUAGE_NAMES, DEFAULT_LANGUAGE
 import session
 
+log = logging.getLogger(__name__)
+
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -53,6 +56,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._full_dims: BoxDimensions | None = None
         self._camera_initialized = False
         self._loading_state = False  # avoids a burst of recomputations during session restore
+
+        # Caches: geometry depends only on dimensions + fillet, the mesh
+        # also on the section. Style-only changes (colors, edges, smooth,
+        # overlay...) reuse them and skip OCCT entirely.
+        self._geom_cache_key = None
+        self._geom_cache = None  # (full_result, outer_applied, inner_applied)
+        self._mesh_cache_key = None
+        self._mesh_cache = None
 
         self.box_color = QtGui.QColor("#bf7f00")
         self.edge_color = QtGui.QColor(0, 0, 0)
@@ -78,13 +89,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- Slider + spinbox for physical measurements: precision 0.01 mm (10 microns) ---
         self.slider_w = PrecisionSlider(20.0, 200.0, 80.0, decimals=2)
-        self.slider_h = PrecisionSlider(20.0, 200.0, 50.0, decimals=2)
-        self.slider_d = PrecisionSlider(10.0, 200.0, 20.0, decimals=2)
+        self.slider_depth = PrecisionSlider(20.0, 200.0, 50.0, decimals=2)
+        self.slider_height = PrecisionSlider(10.0, 200.0, 20.0, decimals=2)
         self.slider_wall = PrecisionSlider(0.0, 20.0, 2.0, decimals=2)
 
         self._add_row("label_width", self.slider_w)
-        self._add_row("label_depth", self.slider_h)
-        self._add_row("label_height", self.slider_d)
+        self._add_row("label_depth", self.slider_depth)
+        self._add_row("label_height", self.slider_height)
         self._add_row("label_wall", self.slider_wall)
 
         # --- Edge rounding (fillet) ---
@@ -202,8 +213,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.timeout.connect(self.update_model)
 
         self.slider_w.valueChanged.connect(self.schedule_update)
-        self.slider_h.valueChanged.connect(self.schedule_update)
-        self.slider_d.valueChanged.connect(self.schedule_update)
+        self.slider_depth.valueChanged.connect(self.schedule_update)
+        self.slider_height.valueChanged.connect(self.schedule_update)
         self.slider_wall.valueChanged.connect(self.schedule_update)
         self.clip_pos.valueChanged.connect(self.schedule_update)
         self.slider_line.valueChanged.connect(self.schedule_update)
@@ -267,8 +278,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _collect_state(self) -> dict:
         return {
             "width": self.slider_w.value(),
-            "depth": self.slider_h.value(),
-            "height": self.slider_d.value(),
+            "depth": self.slider_depth.value(),
+            "height": self.slider_height.value(),
             "wall": self.slider_wall.value(),
             "fillet_enabled": self.chk_fillet.isChecked(),
             "fillet_radius": self.slider_fillet.value(),
@@ -289,8 +300,8 @@ class MainWindow(QtWidgets.QMainWindow):
             state = session.load_state()
 
             self.slider_w.setValue(state.get("width", self.slider_w.value()))
-            self.slider_h.setValue(state.get("depth", self.slider_h.value()))
-            self.slider_d.setValue(state.get("height", self.slider_d.value()))
+            self.slider_depth.setValue(state.get("depth", self.slider_depth.value()))
+            self.slider_height.setValue(state.get("height", self.slider_height.value()))
             self.slider_wall.setValue(state.get("wall", self.slider_wall.value()))
 
             self.chk_fillet.setChecked(state.get("fillet_enabled", False))
@@ -379,13 +390,20 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 plotter.enable_anti_aliasing("ssaa")
             except Exception as e:
-                print("SSAA not available, trying FXAA:", e)
+                log.warning("SSAA not available, trying FXAA: %s", e)
                 try:
                     plotter.enable_anti_aliasing("fxaa")
                 except Exception as e2:
-                    print("FXAA not available, edges without antialiasing:", e2)
+                    log.warning("FXAA not available, edges without antialiasing: %s", e2)
 
         return plotter
+
+    def _render_current_plotter(self):
+        try:
+            self.plotter.renderer.ResetCameraClippingRange()
+            self.plotter.render()
+        except Exception:
+            pass
 
     def reset_view(self):
         self.plotter.reset_camera()
@@ -398,8 +416,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_session()
 
         try:
-            import vtk
-            vtk.vtkObject.GlobalWarningDisplayOff()
+            from vtkmodules.vtkCommonCore import vtkObject
+            vtkObject.GlobalWarningDisplayOff()
         except Exception:
             pass
 
@@ -465,48 +483,133 @@ class MainWindow(QtWidgets.QMainWindow):
     # saved before the swap and reapplied to the new widget, so the
     # framing isn't lost.
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # update_model() helpers. The plotter rebuild / camera / render block
+    # stays inline in update_model() on purpose: its ORDER is delicate
+    # (see the comments there) and must not be split across methods.
+    # ------------------------------------------------------------------
+    def _read_dims(self) -> BoxDimensions:
+        return BoxDimensions(
+            width=self.slider_w.value(),
+            depth=self.slider_depth.value(),
+            height=self.slider_height.value(),
+            wall=self.slider_wall.value(),
+        )
+
+    def _requested_fillet(self) -> float:
+        """Requested fillet radius, or 0 when the fillet is off."""
+        if self.chk_fillet.isChecked() and self.slider_fillet.value() > 0:
+            return self.slider_fillet.value()
+        return 0
+
+    def _build_geometry(self, dims: BoxDimensions, requested_r: float):
+        """Returns (geom_key, full_result, outer_ok, inner_ok). The solid is
+        rebuilt only when dimensions or fillet change."""
+        geom_key = (dims, requested_r)
+        if geom_key != self._geom_cache_key:
+            built = build_box(dims)
+            outer_ok = inner_ok = True
+            if requested_r > 0:
+                built, outer_ok, inner_ok = apply_edge_fillets(built, dims, requested_r)
+            self._geom_cache = (built, outer_ok, inner_ok)
+            self._geom_cache_key = geom_key
+
+        full_result, outer_ok, inner_ok = self._geom_cache
+        return geom_key, full_result, outer_ok, inner_ok
+
+    def _fillet_summary(self, dims, requested_r, outer_ok, inner_ok) -> str:
+        """Extra summary line about the fillet ('' when the fillet is off)."""
+        if requested_r <= 0:
+            return ""
+
+        outer_r, inner_r = compute_fillet_radii(dims, requested_r)
+        if not (outer_ok and inner_ok):
+            return "\n" + self.i18n.t("fillet_failed", req=requested_r)
+        if outer_r < requested_r or inner_r < requested_r:
+            return "\n" + self.i18n.t(
+                "fillet_clamped", req=requested_r, outer=outer_r, inner=inner_r
+            )
+        return "\n" + self.i18n.t("fillet_applied", outer=outer_r)
+
+    def _build_preview_mesh(self, full_result, dims, geom_key):
+        """Mesh for the viewport (with the preview section if active).
+        Rebuilt only when geometry or section change."""
+        axis = self.clip_axis.currentData()
+        clip_active = bool(axis) and axis != "none"
+        clip_pos = self.clip_pos.value() if clip_active else 0
+
+        mesh_key = (geom_key, axis if clip_active else "none", clip_pos)
+        if mesh_key != self._mesh_cache_key:
+            preview_result = full_result
+            if clip_active:
+                try:
+                    preview_result = apply_preview_clip(
+                        full_result, axis, clip_pos / 100.0, dims
+                    )
+                except Exception as clip_error:
+                    log.warning("Error in the section, using the whole model: %s", clip_error)
+                    preview_result = full_result
+
+            self._mesh_cache = build123d_to_pv_mesh(preview_result)
+            self._mesh_cache_key = mesh_key
+
+        return self._mesh_cache
+
+    def _read_style(self) -> RenderStyle:
+        return RenderStyle(
+            base_color=(
+                self.box_color.redF(),
+                self.box_color.greenF(),
+                self.box_color.blueF(),
+            ),
+            edge_color=(
+                self.edge_color.redF(),
+                self.edge_color.greenF(),
+                self.edge_color.blueF(),
+            ),
+            show_edges=self.chk_edges.isChecked(),
+            smooth_shading=self.chk_smooth.isChecked(),
+            line_width=self.slider_line.value() / 10.0,
+            realistic=self.chk_realistic.isChecked(),
+        )
+
+    def _update_annotations(self, dims: BoxDimensions, summary: str):
+        # Corner text AND 3D axes/dimensions added AFTER any plotter swap:
+        # adding them earlier (on the not-yet-visible/swapped widget)
+        # causes a visual jump - empirically identified as the real cause
+        # of the glitch. This specifically concerns anything using
+        # add_text/add_point_labels (labels), not the plain meshes (box,
+        # arrows, lines), which cause no issues even when added earlier.
+        if self.chk_overlay.isChecked():
+            update_dimension_overlay(self.plotter, summary)
+        else:
+            try:
+                self.plotter.remove_actor("dims_overlay")
+            except Exception:
+                pass
+
+        update_reference_annotations(
+            self.plotter, dims.width, dims.depth, dims.height,
+            visible=self.chk_axes.isChecked(),
+            # SSAA is now active in both modes, which breaks label
+            # occlusion: always_visible=True keeps labels readable.
+            label_always_visible=True,
+        )
+
     def update_model(self):
         try:
-            dims = BoxDimensions(
-                width=self.slider_w.value(),
-                depth=self.slider_h.value(),
-                height=self.slider_d.value(),
-                wall=self.slider_wall.value(),
-            )
-
+            dims = self._read_dims()
             summary = self._format_dims_summary(dims)
 
-            full_result = build_box(dims)
-
-            if self.chk_fillet.isChecked() and self.slider_fillet.value() > 0:
-                requested_r = self.slider_fillet.value()
-                outer_r, inner_r = compute_fillet_radii(dims, requested_r)
-                full_result = apply_edge_fillets(full_result, dims, requested_r)
-
-                if outer_r < requested_r or inner_r < requested_r:
-                    summary += "\n" + self.i18n.t(
-                        "fillet_clamped", req=requested_r, outer=outer_r, inner=inner_r
-                    )
-                else:
-                    summary += "\n" + self.i18n.t("fillet_applied", outer=outer_r)
-
+            requested_r = self._requested_fillet()
+            geom_key, full_result, outer_ok, inner_ok = self._build_geometry(dims, requested_r)
+            summary += self._fillet_summary(dims, requested_r, outer_ok, inner_ok)
             self.dims_label.setText(summary)
 
             self._full_result = full_result
             self._full_dims = dims
 
-            preview_result = full_result
-
-            axis = self.clip_axis.currentData()
-            if axis and axis != "none":
-                pos = self.clip_pos.value() / 100.0
-                try:
-                    preview_result = apply_preview_clip(full_result, axis, pos, dims)
-                except Exception as clip_error:
-                    print("Error in the section, using the whole model:", clip_error)
-                    preview_result = full_result
-
-            mesh = build123d_to_pv_mesh(preview_result)
+            mesh = self._build_preview_mesh(full_result, dims, geom_key)
 
             if mesh.n_points == 0 or mesh.n_cells == 0:
                 try:
@@ -515,22 +618,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
                 return
 
-            style = RenderStyle(
-                base_color=(
-                    self.box_color.redF(),
-                    self.box_color.greenF(),
-                    self.box_color.blueF(),
-                ),
-                edge_color=(
-                    self.edge_color.redF(),
-                    self.edge_color.greenF(),
-                    self.edge_color.blueF(),
-                ),
-                show_edges=self.chk_edges.isChecked(),
-                smooth_shading=self.chk_smooth.isChecked(),
-                line_width=self.slider_line.value() / 10.0,
-                realistic=self.chk_realistic.isChecked(),
-            )
+            style = self._read_style()
 
             needs_rebuild = style.realistic != self._last_realistic
             self._last_realistic = style.realistic
@@ -609,6 +697,16 @@ class MainWindow(QtWidgets.QMainWindow):
             if needs_rebuild:
                 _dbg(t0, f"BEFORE plotter.render(). plotter.size={plotter.size()} "
                          f"isVisible={plotter.isVisible()}")
+                # The restored camera keeps the default clipping range of
+                # the new widget, which is not fitted to the model: depth
+                # precision is poor and shadow edges look jagged. Rotating
+                # the view fixes it only because the interactor resets the
+                # range. Do the same here, without moving the camera.
+                try:
+                    plotter.renderer.ResetCameraClippingRange()
+                except Exception:
+                    pass
+
                 try:
                     plotter.render()
                 except Exception as e:
@@ -629,35 +727,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.plotter = plotter
                 _dbg(t0, "REBUILD END")
 
-            # Corner text AND 3D axes/dimensions added here, AFTER any
-            # swap: adding them earlier (on the not-yet-visible/swapped
-            # widget) causes a visual jump - empirically identified as
-            # the real cause of the glitch. This specifically concerns
-            # anything using add_text/add_point_labels (labels), not the
-            # plain meshes (box, arrows, lines), which in fact cause no
-            # issues even when added earlier.
-            if self.chk_overlay.isChecked():
-                update_dimension_overlay(self.plotter, summary)
-            else:
-                try:
-                    self.plotter.remove_actor("dims_overlay")
-                except Exception:
-                    pass
+                # Extra render once the new widget is really shown and
+                # sized: the first frame of a freshly created SSAA+shadow
+                # pipeline can show jagged edges until the next render.
+                QtCore.QTimer.singleShot(50, self._render_current_plotter)
 
-            update_reference_annotations(
-                self.plotter, dims.width, dims.depth, dims.height,
-                visible=self.chk_axes.isChecked(),
-                # In realistic mode (shadows on, AA off to avoid the
-                # render-pass conflict) label occlusion works correctly:
-                # always_visible=False. In normal mode (AA on) occlusion
-                # seems to break due to the same kind of conflict already
-                # seen between FXAA and shadows: always_visible=True,
-                # always on top but at least visible.
-                label_always_visible=not style.realistic,
-            )
+            self._update_annotations(dims, summary)
 
-        except Exception as e:
-            print("Error while updating the model:", e)
+        except Exception:
+            log.exception("Error while updating the model")
 
     def export_stl(self):
         # Two filters in the same dialog: STL for printing as-is, STEP
@@ -690,8 +768,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 export_to_step(self._full_result, path)
             else:
                 export_to_stl(self._full_result, path)
-            print("Model exported:", path)
+            log.info("Model exported: %s", path)
             if self._full_dims is not None:
-                print(self._full_dims.describe())
-        except Exception as e:
-            print("Error during model export:", e)
+                log.info("%s", self._full_dims.describe())
+        except Exception:
+            log.exception("Error during model export")

@@ -6,9 +6,21 @@ calculations. This is the module to check if the PROBLEM is in the
 SHAPE of the solid (wrong cavity, section that cuts badly, etc.).
 """
 
+import logging
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from build123d import Box, Part, Pos
+
+log = logging.getLogger(__name__)
+
+
+class FilletOutcome(NamedTuple):
+    """Result of apply_edge_fillets: the part and what was really applied."""
+
+    part: Part
+    outer_applied: bool
+    inner_applied: bool
 
 
 @dataclass(frozen=True)
@@ -88,23 +100,23 @@ def apply_preview_clip(part: Part, axis: str, pos_fraction: float, dims: BoxDime
 
     pos_fraction = max(0.0, min(1.0, pos_fraction))
 
-    w, h, d = dims.width, dims.depth, dims.height
-    far = max(w, h, d) * 5 + 100
+    width, depth, height = dims.width, dims.depth, dims.height
+    far = max(width, depth, height) * 5 + 100
     eps = 0.01
 
     if axis == "X":
-        x_cut = -w / 2 + w * pos_fraction - eps
-        cutter = Pos(x_cut + far / 2, 0, 0) * Box(far, h * 3 + 100, d * 3 + 100)
+        x_cut = -width / 2 + width * pos_fraction - eps
+        cutter = Pos(x_cut + far / 2, 0, 0) * Box(far, depth * 3 + 100, height * 3 + 100)
         return part - cutter
 
     if axis == "Y":
-        y_cut = -h / 2 + h * pos_fraction - eps
-        cutter = Pos(0, y_cut + far / 2, 0) * Box(w * 3 + 100, far, d * 3 + 100)
+        y_cut = -depth / 2 + depth * pos_fraction - eps
+        cutter = Pos(0, y_cut + far / 2, 0) * Box(width * 3 + 100, far, height * 3 + 100)
         return part - cutter
 
     if axis == "Z":
-        z_cut = -d / 2 + d * pos_fraction - eps
-        cutter = Pos(0, 0, z_cut + far / 2) * Box(w * 3 + 100, h * 3 + 100, far)
+        z_cut = -height / 2 + height * pos_fraction - eps
+        cutter = Pos(0, 0, z_cut + far / 2) * Box(width * 3 + 100, depth * 3 + 100, far)
         return part - cutter
 
     return part
@@ -236,7 +248,9 @@ def compute_fillet_radii(dims: BoxDimensions, requested_radius: float) -> tuple[
     return outer_r, inner_r
 
 
-def apply_edge_fillets(part: Part, dims: BoxDimensions, requested_radius: float) -> Part:
+def apply_edge_fillets(
+    part: Part, dims: BoxDimensions, requested_radius: float
+) -> FilletOutcome:
     """Applies the fillet to the 4 outer corners (vertical + base) and the
     4 inner corners (vertical + cavity floor).
 
@@ -246,29 +260,43 @@ def apply_edge_fillets(part: Part, dims: BoxDimensions, requested_radius: float)
     fillet the solid's topology changes, so the edges for the second pass
     are reselected on the updated result, not reused from the original
     solid.
+
+    Returns a FilletOutcome: the resulting part plus one flag per group
+    telling whether the fillet was really applied. A group that needs no
+    fillet (radius 0, e.g. no cavity) counts as applied. This lets the
+    caller report a failure instead of claiming a radius that is not there.
     """
 
     outer_r, inner_r = compute_fillet_radii(dims, requested_radius)
 
-    if outer_r <= 0 and inner_r <= 0:
-        return part
+    outer_applied = outer_r <= 0
+    inner_applied = inner_r <= 0
+
+    if outer_applied and inner_applied:
+        return FilletOutcome(part, True, True)
 
     result = part
 
-    if outer_r > 0:
+    if not outer_applied:
         outer_edges, _ = _classify_corner_edges(result, dims)
         if outer_edges:
             try:
                 result = result.fillet(outer_r, outer_edges)
+                outer_applied = True
             except Exception as e:
-                print("Outer fillet not applied (radius not valid for this geometry):", e)
+                log.warning("Outer fillet not applied (radius not valid for this geometry): %s", e)
+        else:
+            log.warning("Outer fillet not applied: no corner edges found.")
 
-    if inner_r > 0:
+    if not inner_applied:
         _, inner_edges = _classify_corner_edges(result, dims)
         if inner_edges:
             try:
                 result = result.fillet(inner_r, inner_edges)
+                inner_applied = True
             except Exception as e:
-                print("Inner fillet not applied (radius not valid for this geometry):", e)
+                log.warning("Inner fillet not applied (radius not valid for this geometry): %s", e)
+        else:
+            log.warning("Inner fillet not applied: no corner edges found.")
 
-    return result
+    return FilletOutcome(result, outer_applied, inner_applied)

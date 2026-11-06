@@ -7,9 +7,12 @@ If the PROBLEM is visual (shadows not showing up, wrong colors, mesh
 disappearing), look here.
 """
 
+import logging
 from dataclasses import dataclass
 
 import pyvista as pv
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -51,7 +54,7 @@ class SceneLights:
             self.fill.cone_angle = 180
             self.plotter.add_light(self.fill)
         except Exception as e:
-            print("Lights not available, using default lighting:", e)
+            log.warning("Lights not available, using default lighting: %s", e)
 
     def set_headlight_intensity(self, value: float):
         if self.head is not None:
@@ -59,12 +62,62 @@ class SceneLights:
 
 
 class ShadowController:
-    """Enables/disables ray-traced shadows, with a silent fallback if not supported."""
+    """Enables/disables ray-traced shadows, with a silent fallback if not supported.
+
+    When shadows are enabled, the shadow render-pass chain is wrapped in an
+    SSAA pass (supersampling) so edges stay smooth. PyVista's own SSAA and
+    shadows both call renderer.SetPass(), so the last one would replace the
+    other: the chain is composed manually instead.
+
+    The shadow map resolution is raised too: SSAA cannot smooth the jagged
+    edges of a shadow, because they come from the shadow map texture itself.
+    """
+
+    SHADOW_MAP_SIZE = 4096  # VTK default is 1024; try 8192 if still jagged
 
     def __init__(self, plotter, lights: SceneLights):
         self.plotter = plotter
         self.lights = lights
         self._supported = None  # None = not yet tested on this system
+        self._ssaa = None
+
+    def _set_shadow_map_resolution(self):
+        """Finds the shadow map baker pass inside the chain built by PyVista
+        (camera pass -> sequence pass -> [baker pass, shadow pass])."""
+        try:
+            chain = self.plotter.renderer.GetPass()
+            sequence = chain.GetDelegatePass()
+            passes = sequence.GetPasses()
+            for i in range(passes.GetNumberOfItems()):
+                item = passes.GetItemAsObject(i)
+                if item.GetClassName() == "vtkShadowMapBakerPass":
+                    item.SetResolution(self.SHADOW_MAP_SIZE)
+                    return
+            log.warning("Shadow map baker pass not found, default resolution kept.")
+        except Exception as e:
+            log.warning("Could not raise the shadow map resolution: %s", e)
+
+    def _wrap_with_ssaa(self):
+        if self._ssaa is not None:
+            return  # already wrapped: avoid nesting SSAA inside SSAA
+
+        # Must run BEFORE the wrap, while the chain is still PyVista's own.
+        self._set_shadow_map_resolution()
+
+        try:
+            from vtkmodules.vtkRenderingOpenGL2 import vtkSSAAPass
+
+            renderer = self.plotter.renderer
+            shadow_chain = renderer.GetPass()
+            if shadow_chain is None:
+                return
+
+            ssaa = vtkSSAAPass()
+            ssaa.SetDelegatePass(shadow_chain)
+            renderer.SetPass(ssaa)
+            self._ssaa = ssaa  # keep a reference alive
+        except Exception as e:
+            log.warning("SSAA over shadows not available, shadows without antialiasing: %s", e)
 
     def enable(self):
         self.lights.set_headlight_intensity(0.0)
@@ -77,10 +130,14 @@ class ShadowController:
             self._supported = True
         except Exception as e:
             self._supported = False
-            print("Shadows not available, using advanced shading only:", e)
+            log.warning("Shadows not available, using advanced shading only: %s", e)
+            return
+
+        self._wrap_with_ssaa()
 
     def disable(self):
         self.lights.set_headlight_intensity(0.5)
+        self._ssaa = None
         try:
             self.plotter.disable_shadows()
         except Exception:
