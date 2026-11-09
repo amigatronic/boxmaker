@@ -11,6 +11,7 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from pyvistaqt import QtInteractor
 import pyvista as pv
 import logging
+import os
 import time
 
 # DEBUG: detailed diagnostics on the 3D widget rebuild (dimensions,
@@ -29,7 +30,13 @@ def _dbg(t0, msg):
 # must be disabled BEFORE any plotter/QtInteractor is created.
 pv.global_theme.multi_samples = 0
 
-from geometry import BoxDimensions, build_box, apply_preview_clip, apply_edge_fillets, compute_fillet_radii
+from fonts import scan_fonts, is_usable_font
+from geometry import BoxDimensions, build_filleted_box, apply_preview_clip
+from shapes import (
+    ShapeSpec, ShapeError, SvgImportError, load_svg_profile, SHAPE_CODES, SHAPE_RECT, SHAPE_CIRCLE,
+    SHAPE_POLYGON, SHAPE_SVG, SHAPE_TEXT, SHAPES_WITHOUT_DEPTH, MIN_SIDES, MAX_SIDES, MAX_GROW,
+    DEFAULT_FONT,
+)
 from mesh_utils import build123d_to_pv_mesh
 from rendering import SceneLights, ShadowController, RenderStyle, render_mesh, update_dimension_overlay
 from dimension_annotations import setup_orientation_widget, update_reference_annotations
@@ -39,6 +46,10 @@ from i18n import Translator, SUPPORTED_LANGUAGES, LANGUAGE_NAMES, DEFAULT_LANGUA
 import session
 
 log = logging.getLogger(__name__)
+
+# While a slider is being dragged, the model updates live only if the last
+# update took less than this (seconds); otherwise it waits for the release.
+LIVE_UPDATE_LIMIT_S = 0.4
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -53,6 +64,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1200, 700)
 
         self._full_result = None
+        # Imported SVG profile: path + token (the token changes at every
+        # import and invalidates the geometry cache)
+        self._svg_path = ""
+        self._svg_token = 0
+        self._last_shape_code = SHAPE_RECT
+        self._font_path = ""  # empty = system font (DEFAULT_FONT)
+        self._last_update_seconds = 0.0  # duration of the last model update
         self._full_dims: BoxDimensions | None = None
         self._camera_initialized = False
         self._loading_state = False  # avoids a burst of recomputations during session restore
@@ -61,7 +79,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # also on the section. Style-only changes (colors, edges, smooth,
         # overlay...) reuse them and skip OCCT entirely.
         self._geom_cache_key = None
-        self._geom_cache = None  # (full_result, outer_applied, inner_applied)
+        self._geom_cache = None  # FilletOutcome
         self._mesh_cache_key = None
         self._mesh_cache = None
 
@@ -87,6 +105,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lang_combo.currentIndexChanged.connect(self._on_language_changed)
         self._add_row("label_language", self.lang_combo)
 
+        # --- Shape of the box: the 2D profile that gets extruded ---
+        self.shape_combo = QtWidgets.QComboBox()
+        for code in SHAPE_CODES:
+            self.shape_combo.addItem("", userData=code)  # texts set in retranslate_ui
+        self.shape_combo.currentIndexChanged.connect(self._on_shape_changed)
+        self._add_row("label_shape", self.shape_combo)
+
         # --- Slider + spinbox for physical measurements: precision 0.01 mm (10 microns) ---
         self.slider_w = PrecisionSlider(20.0, 200.0, 80.0, decimals=2)
         self.slider_depth = PrecisionSlider(20.0, 200.0, 50.0, decimals=2)
@@ -95,6 +120,55 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._add_row("label_width", self.slider_w)
         self._add_row("label_depth", self.slider_depth)
+
+        self.slider_sides = LabeledSlider(MIN_SIDES, MAX_SIDES, 6, unit="")
+        self._add_row("label_sides", self.slider_sides)
+
+        # SVG import: button + info about the loaded file
+        self.svg_row = QtWidgets.QWidget()
+        svg_layout = QtWidgets.QVBoxLayout(self.svg_row)
+        svg_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_import_svg = QtWidgets.QPushButton()
+        self.btn_import_svg.clicked.connect(self._on_import_svg_clicked)
+        self._self_label_widgets.append((self.btn_import_svg, "button_import_svg"))
+        self.svg_info_label = QtWidgets.QLabel()
+        self.svg_info_label.setWordWrap(True)
+        svg_layout.addWidget(self.btn_import_svg)
+        svg_layout.addWidget(self.svg_info_label)
+        self._add_row("label_svg", self.svg_row)
+
+        # Text shape: text, font file and letter growth
+        self.text_edit = QtWidgets.QLineEdit("Logo")
+        self.text_edit.setMaxLength(60)
+        self.text_edit.textChanged.connect(self.schedule_update)
+        self._add_row("label_text", self.text_edit)
+
+        self.font_row = QtWidgets.QWidget()
+        font_layout = QtWidgets.QVBoxLayout(self.font_row)
+        font_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Installed fonts are read from the font folders (see fonts.py) and
+        # filled in the first time the text shape is used. The first item
+        # is always "system default".
+        self.font_combo = QtWidgets.QComboBox()
+        self.font_combo.setEditable(True)
+        self.font_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        completer = self.font_combo.completer()
+        completer.setFilterMode(QtCore.Qt.MatchContains)
+        completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        self.font_combo.addItem("", userData="")
+        self._fonts_loaded = False
+        self.font_combo.activated.connect(self._on_font_selected)
+
+        self.btn_choose_font = QtWidgets.QPushButton()
+        self.btn_choose_font.clicked.connect(self._on_choose_font_clicked)
+        self._self_label_widgets.append((self.btn_choose_font, "button_choose_font"))
+        font_layout.addWidget(self.font_combo)
+        font_layout.addWidget(self.btn_choose_font)
+        self._add_row("label_font", self.font_row)
+
+        self.slider_grow = PrecisionSlider(0.0, MAX_GROW, 0.0, decimals=2)
+        self._add_row("label_grow", self.slider_grow)
         self._add_row("label_height", self.slider_height)
         self._add_row("label_wall", self.slider_wall)
 
@@ -212,12 +286,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.update_model)
 
-        self.slider_w.valueChanged.connect(self.schedule_update)
-        self.slider_depth.valueChanged.connect(self.schedule_update)
-        self.slider_height.valueChanged.connect(self.schedule_update)
-        self.slider_wall.valueChanged.connect(self.schedule_update)
-        self.clip_pos.valueChanged.connect(self.schedule_update)
-        self.slider_line.valueChanged.connect(self.schedule_update)
+        # Sliders: while dragging, the model follows live only if the last
+        # update was quick; with a heavy model (text, SVG, fillet) it is
+        # updated when the handle is released.
+        self._drag_sliders = [
+            self.slider_w, self.slider_depth, self.slider_sides, self.slider_grow,
+            self.slider_height, self.slider_wall, self.clip_pos, self.slider_line,
+            self.slider_fillet,
+        ]
+        for slider in self._drag_sliders:
+            slider.valueChanged.connect(self._on_param_changed)
+            slider.released.connect(self.schedule_update)
 
         self.clip_axis.currentIndexChanged.connect(self.schedule_update)
         self.chk_edges.stateChanged.connect(self.schedule_update)
@@ -226,7 +305,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_overlay.stateChanged.connect(self.schedule_update)
         self.chk_axes.stateChanged.connect(self.schedule_update)
         self.chk_fillet.stateChanged.connect(self._on_fillet_toggled)
-        self.slider_fillet.valueChanged.connect(self.schedule_update)
 
         self.retranslate_ui()
         self._restore_session()
@@ -263,6 +341,182 @@ class MainWindow(QtWidgets.QMainWindow):
         # text of the "none" entry, the index/selection doesn't change.
         self.clip_axis.setItemText(0, self.i18n.t("clip_axis_none"))
 
+        for index, code in enumerate(SHAPE_CODES):
+            self.shape_combo.setItemText(index, self.i18n.t(f"shape_{code}"))
+
+        self._apply_shape_controls()
+
+    # ------------------------------------------------------------------
+    # Shape selector (primitives + SVG profile)
+    # ------------------------------------------------------------------
+    def _current_shape_code(self) -> str:
+        return self.shape_combo.currentData() or SHAPE_RECT
+
+    def _apply_shape_controls(self):
+        """Shows only the controls that make sense for the chosen shape and
+        names the first measure accordingly (diameter or width)."""
+        code = self._current_shape_code()
+
+        self.form.setRowVisible(self.slider_depth, code not in SHAPES_WITHOUT_DEPTH)
+        self.form.setRowVisible(self.slider_sides, code == SHAPE_POLYGON)
+        self.form.setRowVisible(self.svg_row, code == SHAPE_SVG)
+        self.form.setRowVisible(self.text_edit, code == SHAPE_TEXT)
+        self.form.setRowVisible(self.font_row, code == SHAPE_TEXT)
+        self.form.setRowVisible(self.slider_grow, code == SHAPE_TEXT)
+
+        label = self.form.labelForField(self.slider_w)
+        if label is not None:
+            key = "label_diameter" if code in (SHAPE_CIRCLE, SHAPE_POLYGON) else "label_width"
+            label.setText(self.i18n.t(key))
+
+        self._refresh_svg_info()
+        self._refresh_font_controls()
+
+    def _refresh_font_controls(self):
+        self.font_combo.setItemText(0, self.i18n.t("font_default", font=DEFAULT_FONT))
+        if self._current_shape_code() == SHAPE_TEXT:
+            self._ensure_font_list()
+            self._select_font_in_combo()
+
+    def _ensure_font_list(self):
+        """Fills the combo box with the installed fonts (only once)."""
+        if self._fonts_loaded:
+            return
+        self._fonts_loaded = True
+
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            entries = scan_fonts()
+        except Exception:
+            log.exception("Font scan failed")
+            entries = []
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        self.font_combo.blockSignals(True)
+        for entry in entries:
+            self.font_combo.addItem(entry.label, userData=entry.path)
+        self.font_combo.blockSignals(False)
+        log.info("%d installed fonts listed", len(entries))
+
+    def _select_font_in_combo(self):
+        """Shows the current font in the combo box (adds it if it is a
+        custom file that is not in the list)."""
+        index = 0
+        if self._font_path:
+            index = self.font_combo.findData(self._font_path)
+            if index < 0:
+                label = self.i18n.t("font_file_entry", name=os.path.basename(self._font_path))
+                self.font_combo.addItem(label, userData=self._font_path)
+                index = self.font_combo.count() - 1
+
+        self.font_combo.blockSignals(True)
+        self.font_combo.setCurrentIndex(index)
+        self.font_combo.blockSignals(False)
+
+    def _on_font_selected(self, index: int):
+        self._font_path = self.font_combo.itemData(index) or ""
+        self.schedule_update()
+
+    def _on_choose_font_clicked(self):
+        # NOT the Windows Fonts folder: it is a virtual folder where the
+        # dialog cannot open files; installed fonts are in the list above.
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            self.i18n.t("dialog_choose_font_title"),
+            os.path.expanduser("~"),
+            "Fonts (*.ttf *.otf *.ttc)",
+        )
+        if not path:
+            return
+
+        if not is_usable_font(path):
+            QtWidgets.QMessageBox.warning(
+                self, self.i18n.t("dialog_choose_font_title"), self.i18n.t("font_invalid")
+            )
+            return
+
+        self._font_path = path
+        self._select_font_in_combo()
+        self.schedule_update()
+
+    def _refresh_svg_info(self):
+        if not self._svg_path:
+            self.svg_info_label.setText(self.i18n.t("svg_none"))
+            return
+        profile_info = getattr(self, "_svg_summary", None)
+        name = os.path.basename(self._svg_path)
+        if profile_info is None:
+            self.svg_info_label.setText(name)
+        else:
+            holes, ignored = profile_info
+            self.svg_info_label.setText(
+                self.i18n.t("svg_info", name=name, holes=holes, ignored=ignored)
+            )
+
+    def _set_shape_code(self, code: str):
+        """Selects a shape in the combo box WITHOUT triggering the handler."""
+        if code not in SHAPE_CODES:
+            code = SHAPE_RECT
+        self.shape_combo.blockSignals(True)
+        self.shape_combo.setCurrentIndex(SHAPE_CODES.index(code))
+        self.shape_combo.blockSignals(False)
+        self._last_shape_code = code
+        self._apply_shape_controls()
+
+    def _on_shape_changed(self, index: int):
+        if self._loading_state:
+            return
+        code = self._current_shape_code()
+
+        if code == SHAPE_SVG and not self._svg_path:
+            # An SVG shape needs a file: ask for it right away; if the user
+            # cancels (or the file is not usable) go back to the previous shape.
+            if not self._import_svg_dialog():
+                self._set_shape_code(self._last_shape_code)
+                return
+
+        self._last_shape_code = code
+        self._apply_shape_controls()
+        self.schedule_update()
+
+    def _on_import_svg_clicked(self):
+        if self._import_svg_dialog():
+            self.schedule_update()
+
+    def _load_svg(self, path: str) -> bool:
+        """Loads the SVG profile; shows the error to the user on failure."""
+        try:
+            profile = load_svg_profile(path, self._svg_token + 1)
+        except SvgImportError as e:
+            QtWidgets.QMessageBox.warning(
+                self,
+                self.i18n.t("svg_error_title"),
+                self.i18n.t(f"svg_error_{e.code}", detail=e.detail),
+            )
+            return False
+        except Exception as e:  # unexpected failure in the SVG/OCCT libraries
+            log.exception("SVG import failed")
+            QtWidgets.QMessageBox.warning(
+                self, self.i18n.t("svg_error_title"),
+                self.i18n.t("svg_error_read_failed", detail=str(e)),
+            )
+            return False
+
+        self._svg_token += 1
+        self._svg_path = path
+        self._svg_summary = (profile.holes_used, profile.shapes_ignored)
+        self._refresh_svg_info()
+        return True
+
+    def _import_svg_dialog(self) -> bool:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, self.i18n.t("dialog_import_svg_title"), self._svg_path or "", "SVG (*.svg)"
+        )
+        if not path:
+            return False
+        return self._load_svg(path)
+
     def _on_language_changed(self, index: int):
         code = self.lang_combo.itemData(index)
         if not code or code == self.i18n.lang:
@@ -281,6 +535,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "depth": self.slider_depth.value(),
             "height": self.slider_height.value(),
             "wall": self.slider_wall.value(),
+            "shape": self._current_shape_code(),
+            "sides": self.slider_sides.value(),
+            "svg_path": self._svg_path,
+            "text": self.text_edit.text(),
+            "font_path": self._font_path,
+            "grow": self.slider_grow.value(),
             "fillet_enabled": self.chk_fillet.isChecked(),
             "fillet_radius": self.slider_fillet.value(),
             "clip_axis_index": self.clip_axis.currentIndex(),
@@ -303,6 +563,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.slider_depth.setValue(state.get("depth", self.slider_depth.value()))
             self.slider_height.setValue(state.get("height", self.slider_height.value()))
             self.slider_wall.setValue(state.get("wall", self.slider_wall.value()))
+            self.slider_sides.setValue(state.get("sides", self.slider_sides.value()))
+
+            self.text_edit.setText(state.get("text", self.text_edit.text()))
+            self.slider_grow.setValue(state.get("grow", self.slider_grow.value()))
+            font_path = state.get("font_path", "")
+            self._font_path = font_path if font_path and is_usable_font(font_path) else ""
+
+            shape_code = state.get("shape", SHAPE_RECT)
+            svg_path = state.get("svg_path", "")
+            if svg_path and os.path.isfile(svg_path):
+                self._load_svg(svg_path)
+            if shape_code == SHAPE_SVG and not self._svg_path:
+                shape_code = SHAPE_RECT  # the file is gone: do not ask at startup
+            self._set_shape_code(shape_code)
 
             self.chk_fillet.setChecked(state.get("fillet_enabled", False))
             self.slider_fillet.setValue(state.get("fillet_radius", self.slider_fillet.value()))
@@ -435,6 +709,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         event.accept()
 
+    def _on_param_changed(self, *_):
+        """A slider/spin value changed. During a drag, a slow model waits for
+        the release instead of recomputing at every step."""
+        if self._last_update_seconds > LIVE_UPDATE_LIMIT_S and any(
+            slider.is_dragging() for slider in self._drag_sliders
+        ):
+            return
+        self.schedule_update()
+
     def schedule_update(self, *_):
         if self._loading_state:
             return
@@ -462,7 +745,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _format_dims_summary(self, dims: BoxDimensions) -> str:
         t = self.i18n.t
-        lines = [t("dims_outer", w=dims.width, d=dims.depth, h=dims.height)]
+        lines = []
+        kind = dims.shape.kind
+        if kind != SHAPE_RECT:
+            name = t(f"shape_{kind}")
+            if kind == SHAPE_POLYGON:
+                name = t("shape_polygon_n", n=dims.shape.sides)
+            elif kind == SHAPE_SVG:
+                name = f"{name} ({os.path.basename(dims.shape.svg_path)})"
+            elif kind == SHAPE_TEXT:
+                name = f"{name}: {dims.shape.text}"
+            lines.append(t("dims_shape", shape=name))
+            if dims.profiles.pieces > 1:
+                lines.append(t("dims_pieces", n=dims.profiles.pieces))
+        lines.append(t("dims_outer", w=dims.bbox_width, d=dims.bbox_depth, h=dims.height))
         if dims.has_valid_cavity:
             lines.append(
                 t("dims_inner", iw=dims.inner_width, idepth=dims.inner_depth, ih=dims.inner_height)
@@ -489,11 +785,27 @@ class MainWindow(QtWidgets.QMainWindow):
     # (see the comments there) and must not be split across methods.
     # ------------------------------------------------------------------
     def _read_dims(self) -> BoxDimensions:
+        code = self._current_shape_code()
+        if code == SHAPE_SVG and not self._svg_path:
+            code = SHAPE_RECT
+        text = self.text_edit.text() if code == SHAPE_TEXT else ""
+        if code == SHAPE_TEXT and not text.strip():
+            code = SHAPE_RECT  # nothing to draw yet (the field is empty)
+        shape = ShapeSpec(
+            kind=code,
+            sides=self.slider_sides.value(),
+            svg_path=self._svg_path if code == SHAPE_SVG else "",
+            svg_token=self._svg_token if code == SHAPE_SVG else 0,
+            text=text,
+            font_path=self._font_path if code == SHAPE_TEXT else "",
+            grow=self.slider_grow.value() if code == SHAPE_TEXT else 0.0,
+        )
         return BoxDimensions(
             width=self.slider_w.value(),
             depth=self.slider_depth.value(),
             height=self.slider_height.value(),
             wall=self.slider_wall.value(),
+            shape=shape,
         )
 
     def _requested_fillet(self) -> float:
@@ -503,33 +815,40 @@ class MainWindow(QtWidgets.QMainWindow):
         return 0
 
     def _build_geometry(self, dims: BoxDimensions, requested_r: float):
-        """Returns (geom_key, full_result, outer_ok, inner_ok). The solid is
-        rebuilt only when dimensions or fillet change."""
+        """Returns (geom_key, outcome). The solid is rebuilt only when
+        dimensions, shape or fillet change."""
         geom_key = (dims, requested_r)
         if geom_key != self._geom_cache_key:
-            built = build_box(dims)
-            outer_ok = inner_ok = True
-            if requested_r > 0:
-                built, outer_ok, inner_ok = apply_edge_fillets(built, dims, requested_r)
-            self._geom_cache = (built, outer_ok, inner_ok)
+            self._geom_cache = build_filleted_box(dims, requested_r)
             self._geom_cache_key = geom_key
 
-        full_result, outer_ok, inner_ok = self._geom_cache
-        return geom_key, full_result, outer_ok, inner_ok
+        return geom_key, self._geom_cache
 
-    def _fillet_summary(self, dims, requested_r, outer_ok, inner_ok) -> str:
-        """Extra summary line about the fillet ('' when the fillet is off)."""
+    def _fillet_summary(self, dims, requested_r, outcome) -> str:
+        """Extra summary line about the fillet ('' when the fillet is off).
+        Radii are the ones REALLY applied (they can be smaller than the
+        requested one)."""
         if requested_r <= 0:
             return ""
 
-        outer_r, inner_r = compute_fillet_radii(dims, requested_r)
-        if not (outer_ok and inner_ok):
-            return "\n" + self.i18n.t("fillet_failed", req=requested_r)
-        if outer_r < requested_r or inner_r < requested_r:
-            return "\n" + self.i18n.t(
-                "fillet_clamped", req=requested_r, outer=outer_r, inner=inner_r
-            )
-        return "\n" + self.i18n.t("fillet_applied", outer=outer_r)
+        t = self.i18n.t
+        if not (outcome.outer_applied and outcome.inner_applied):
+            return "\n" + t("fillet_failed", req=requested_r)
+
+        outer_r, inner_r = outcome.outer_radius, outcome.inner_radius
+        reduced = outer_r < requested_r - 1e-6
+
+        if not dims.has_valid_cavity:
+            # Closed prism: a single radius, applied to all the edges.
+            if reduced:
+                return "\n" + t("fillet_clamped_closed", req=requested_r, outer=outer_r)
+            return "\n" + t("fillet_applied_closed", outer=outer_r)
+
+        # The inner radius follows the outer one by design, so only the
+        # OUTER radius can be "clamped" with respect to the request.
+        if reduced:
+            return "\n" + t("fillet_clamped", req=requested_r, outer=outer_r, inner=inner_r)
+        return "\n" + t("fillet_applied", outer=outer_r, inner=inner_r)
 
     def _build_preview_mesh(self, full_result, dims, geom_key):
         """Mesh for the viewport (with the preview section if active).
@@ -589,7 +908,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
         update_reference_annotations(
-            self.plotter, dims.width, dims.depth, dims.height,
+            self.plotter, dims.bbox_width, dims.bbox_depth, dims.height,
             visible=self.chk_axes.isChecked(),
             # SSAA is now active in both modes, which breaks label
             # occlusion: always_visible=True keeps labels readable.
@@ -597,13 +916,28 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def update_model(self):
+        """Rebuilds the model and refreshes the preview. Shows a wait cursor
+        and records how long it took (used to decide whether a slider drag
+        can update the model live)."""
+        start = time.perf_counter()
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            self._update_model_impl()
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._last_update_seconds = time.perf_counter() - start
+            if self._last_update_seconds > 1.0:
+                log.info("Slow model update: %.2f s", self._last_update_seconds)
+
+    def _update_model_impl(self):
         try:
             dims = self._read_dims()
             summary = self._format_dims_summary(dims)
 
             requested_r = self._requested_fillet()
-            geom_key, full_result, outer_ok, inner_ok = self._build_geometry(dims, requested_r)
-            summary += self._fillet_summary(dims, requested_r, outer_ok, inner_ok)
+            geom_key, outcome = self._build_geometry(dims, requested_r)
+            full_result = outcome.part
+            summary += self._fillet_summary(dims, requested_r, outcome)
             self.dims_label.setText(summary)
 
             self._full_result = full_result
@@ -616,6 +950,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.plotter.remove_actor("model")
                 except Exception:
                     pass
+                self._update_annotations(dims, summary)
+                self._render_current_plotter()
                 return
 
             style = self._read_style()
@@ -734,6 +1070,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self._update_annotations(dims, summary)
 
+        except ShapeError as e:
+            # Expected failure (e.g. growth larger than the text): tell the
+            # user in the panel instead of only writing to the log.
+            log.warning("Shape not available: %s", e)
+            key = f"shape_error_{e.code}"
+            text = self.i18n.t(key, detail=e.detail)
+            if text == key:
+                text = self.i18n.t("shape_error_generic", detail=str(e))
+            self.dims_label.setText(text)
         except Exception:
             log.exception("Error while updating the model")
 

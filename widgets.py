@@ -14,6 +14,7 @@ class LabeledSlider(QtWidgets.QWidget):
     """
 
     valueChanged = QtCore.Signal(int)
+    released = QtCore.Signal()  # the user let go of the slider handle
 
     def __init__(self, min_val: int, max_val: int, initial: int, unit: str = "mm", parent=None):
         super().__init__(parent)
@@ -36,6 +37,10 @@ class LabeledSlider(QtWidgets.QWidget):
         layout.addWidget(self.value_label)
 
         self.slider.valueChanged.connect(self._on_value_changed)
+        self.slider.sliderReleased.connect(self.released)
+
+    def is_dragging(self) -> bool:
+        return self.slider.isSliderDown()
 
     def _format(self, value: int) -> str:
         return f"{value} {self._unit}"
@@ -64,6 +69,7 @@ class PrecisionSlider(QtWidgets.QWidget):
     """
 
     valueChanged = QtCore.Signal(float)
+    released = QtCore.Signal()  # the user let go of the slider handle
 
     def __init__(
         self,
@@ -94,12 +100,20 @@ class PrecisionSlider(QtWidgets.QWidget):
         self.spin.setSuffix(f" {unit}")
         self.spin.setValue(initial)
         self.spin.setMinimumWidth(90)
+        # Typing a value (e.g. 100) must not trigger an update for every
+        # digit: the value is applied on Enter / when the field loses focus.
+        # The arrows and the slider still update immediately.
+        self.spin.setKeyboardTracking(False)
 
         layout.addWidget(self.slider, 1)
         layout.addWidget(self.spin)
 
         self.slider.valueChanged.connect(self._on_slider_changed)
+        self.slider.sliderReleased.connect(self.released)
         self.spin.valueChanged.connect(self._on_spin_changed)
+
+    def is_dragging(self) -> bool:
+        return self.slider.isSliderDown()
 
     def _on_slider_changed(self, raw: int):
         if self._updating:
